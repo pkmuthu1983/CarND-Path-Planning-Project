@@ -8,7 +8,9 @@
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
+#include "spline.h"
 
+#define PRINTSF
 using namespace std;
 
 // for convenience
@@ -72,18 +74,18 @@ int NextWaypoint(double x, double y, double theta, const vector<double> &maps_x,
 	double heading = atan2((map_y-y),(map_x-x));
 
 	double angle = fabs(theta-heading);
-  angle = min(2*pi() - angle, angle);
+	angle = min(2*pi() - angle, angle);
 
-  if(angle > pi()/4)
-  {
-    closestWaypoint++;
-  if (closestWaypoint == maps_x.size())
-  {
-    closestWaypoint = 0;
-  }
-  }
+	if(angle > pi()/4)
+	{
+		closestWaypoint++;
+		if (closestWaypoint == maps_x.size())
+		{
+		closestWaypoint = 0;
+		}
+	}
 
-  return closestWaypoint;
+	return closestWaypoint;
 }
 
 // Transform from Cartesian x,y coordinates to Frenet s,d coordinates
@@ -163,6 +165,66 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 
 }
 
+void printpoints(vector<double> x, vector<double> y, string name) {
+#ifdef DEBUG
+	cout << "Points " << name << endl;
+	for (int i=0; i<x.size(); i++){
+		cout << "idx - " << i << ", (" << x[i] << ", " << y[i] << ")" << endl;
+	}
+#endif
+}
+
+void printfusiondata(vector< vector<double> > sf, int iter) {
+#ifdef DEBUG
+	cout << "Iter " << iter << ", Fusion data size" << sf.size() << endl;
+	for (int i=0; i<sf.size(); i++) {
+		for (int j=0; j<7; j++) {
+			cout << sf[i][j] << ",";
+		}
+		cout << endl;
+	}
+#endif
+}
+
+void printlanedata(int curlane, vector<int> nextlanes,
+    vector<int> lanegd, int bestlane, vector<vector<double> > sf, int iter) {
+
+#ifdef DEBUG
+	assert (nextlanes.size() == lanegd.size());
+
+	cout << "Considering lane change. " << (bestlane == -1 ? "None found": "Good lane found") << endl;
+	cout << "cur lane " << curlane << endl;
+
+	for (int i=0; i<lanegd.size(); i++) {
+		cout << nextlanes[i] << ": " << lanegd[i] << ",";
+	}
+	cout << "bestlane " << bestlane << endl;
+
+	cout << "Iter " << iter << ", Fusion data size" << sf.size() << endl;
+
+	for (int i=0; i<sf.size(); i++) {
+		for (int j=0; j<7; j++) {
+			cout << sf[i][j] << ",";
+		}
+		cout << endl;
+	}
+#endif
+}
+
+int findlane(double d) {
+	int lane = 0;
+	if (d >= 0 && d<4) {
+		lane = 0;	
+	} else if (d >= 4 && d < 8) {
+		lane = 1;
+	} else if (d >= 8 && d < 12) {
+		lane = 2;
+	} else {
+		lane = -1;
+	}
+	return lane;
+}
+
 int main() {
   uWS::Hub h;
 
@@ -177,6 +239,9 @@ int main() {
   string map_file_ = "../data/highway_map.csv";
   // The max s value before wrapping around the track back to 0
   double max_s = 6945.554;
+  double ref_v = 0;
+  int curlane = -1, nextlane = -1, lane_change_ongoing = 0, last_lane_change = 0;
+  int iter = 0;
 
   ifstream in_map_(map_file_.c_str(), ifstream::in);
 
@@ -200,13 +265,16 @@ int main() {
   	map_waypoints_dy.push_back(d_y);
   }
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+  h.onMessage([&iter, &ref_v, &curlane, &nextlane, &lane_change_ongoing, &last_lane_change, &map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
     // The 2 signifies a websocket event
     //auto sdata = string(data).substr(0, length);
     //cout << sdata << endl;
+
+    iter++;
+
     if (length && length > 2 && data[0] == '4' && data[1] == '2') {
 
       auto s = hasData(data);
@@ -230,7 +298,7 @@ int main() {
           	// Previous path data given to the Planner
           	auto previous_path_x = j[1]["previous_path_x"];
           	auto previous_path_y = j[1]["previous_path_y"];
-          	// Previous path's end s and d values 
+          	// Previous path's end s and d values
           	double end_path_s = j[1]["end_path_s"];
           	double end_path_d = j[1]["end_path_d"];
 
@@ -242,8 +310,224 @@ int main() {
           	vector<double> next_x_vals;
           	vector<double> next_y_vals;
 
+		vector<double> pts_x;
+		vector<double> pts_y;
 
-          	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
+		double dist_inc = 0.44;
+
+		double ref_x;
+		double ref_y;
+		double angle;
+
+		int path_size = previous_path_x.size();
+
+		if (curlane == -1) {
+			curlane = findlane(car_d);
+		}
+
+		double car_s_orig = car_s;
+
+		if (path_size > 0) {
+			car_s = end_path_s;
+		}
+
+		bool tooclose = false;
+		double car_in_front_s = 1000;
+		int car_in_front_id = -1;
+		double car_in_front_speed = 0;
+
+		for (int i=0; i< sensor_fusion.size(); i++){
+			double d = sensor_fusion[i][6];
+			if ((d >= car_d - 2 && d <= car_d + 2) ||
+			    (findlane(car_d) == findlane(d)) ) {
+				double vx = sensor_fusion[i][3];
+				double vy = sensor_fusion[i][4];
+				double opp_car_speed = sqrt(vx*vx + vy*vy);
+				double opp_car_s = sensor_fusion[i][5];
+				if (opp_car_s > car_s && opp_car_s - car_s < 30) {
+					tooclose = true;
+					if (opp_car_s < car_in_front_s) {
+						car_in_front_s = opp_car_s;
+						car_in_front_id = i;
+					}
+				}
+			}
+		}
+
+		if (car_in_front_id != -1) {
+			double vx = sensor_fusion[car_in_front_id][3];
+			double vy = sensor_fusion[car_in_front_id][4];
+			car_in_front_speed = sqrt(vx*vx + vy*vy) * 2.23 - 2;
+		}
+
+		if (tooclose) {
+			if (car_in_front_id != -1 && ref_v < car_in_front_speed) {
+				ref_v = car_in_front_speed;
+#ifdef DEBUG	
+				cout << "Following car " << car_in_front_id << " with " << car_in_front_speed << endl;
+#endif
+			} else {
+				ref_v -= 0.5;
+			}
+		} else if (ref_v < 49) {
+			ref_v += 0.5;
+		}
+
+		if (tooclose && !lane_change_ongoing && (iter - last_lane_change > 250) ) {
+			vector<int> nextlanes;
+			if (curlane == 0) {
+				nextlanes.push_back(1);
+			} else if (curlane == 1) {
+				nextlanes.push_back(0);
+				nextlanes.push_back(2);
+			} else if (curlane == 2) {
+				nextlanes.push_back(1);
+			} else {
+				assert(false);
+			}
+
+			vector<int> lanegood;
+	
+			int bestlane = -1;
+
+			for (int j = 0; j < nextlanes.size(); j++) {
+				int thislane = nextlanes[j];
+				lanegood.push_back(1);
+
+				for (int i=0; i< sensor_fusion.size(); i++){
+					double d = sensor_fusion[i][6];
+					if (d >= (2 + 4 * thislane - 2) && d <= (2 + 4 * thislane + 2)) {
+						double vx = sensor_fusion[i][3];
+						double vy = sensor_fusion[i][4];
+						double opp_car_speed = sqrt(vx*vx + vy*vy);
+						double opp_car_s = sensor_fusion[i][5];
+						opp_car_s += opp_car_speed * 0.02 * path_size;
+
+						if (abs(opp_car_s - car_s) < 30 ||
+						    abs(opp_car_s - car_s_orig) < 30) {
+							lanegood[j] = 0;
+							break;
+						}
+					}
+				}
+			}
+
+			for (int j = 0; j < nextlanes.size(); j++) {
+				if (lanegood[j] == 1) {
+					bestlane = nextlanes[j];
+					break;
+				}
+			}
+
+			if (bestlane != -1) {
+				lane_change_ongoing = 1;
+				nextlane = bestlane;
+				last_lane_change = iter;
+			}
+
+			printlanedata(curlane, nextlanes, lanegood, bestlane, sensor_fusion, iter);
+		}
+
+		double lane = -1;
+
+		if (lane_change_ongoing == 1) {
+			lane = nextlane;
+		} else {
+			lane = curlane;
+		}
+
+		if (nextlane != -1 && curlane != nextlane) {
+			cout << "Lane changing from " << curlane << " to " << nextlane << ". car_s " << car_s << ", car_d " << car_d << endl;
+			if (findlane(car_d) == nextlane) {
+				curlane = nextlane;
+				lane_change_ongoing = 0;
+				nextlane = -1;
+#ifdef DEBUG	
+				cout << "Lane change complete" << endl;
+#endif
+			}
+		}
+
+
+		double ref_speed_ms = ref_v/2.23;
+
+		if(path_size < 2) {
+			angle = deg2rad(car_yaw);
+			double prv_x = car_x - dist_inc * cos(angle);
+			double prv_y = car_y - dist_inc * sin(angle);
+			pts_x.push_back(prv_x);
+			pts_x.push_back(car_x);
+			pts_y.push_back(prv_y);
+			pts_y.push_back(car_y);
+			ref_x = car_x;
+			ref_y = car_y;
+		} else {
+			double ref_x_1, ref_x_2, ref_y_1, ref_y_2;
+			ref_x_2 = previous_path_x[path_size-2];
+			ref_x_1 = previous_path_x[path_size-1];
+			ref_y_2 = previous_path_y[path_size-2];
+			ref_y_1 = previous_path_y[path_size-1];
+
+			pts_x.push_back(ref_x_2);
+			pts_x.push_back(ref_x_1);
+			pts_y.push_back(ref_y_2);
+			pts_y.push_back(ref_y_1);
+			angle = atan2(ref_y_1 - ref_y_2, ref_x_1 - ref_x_2);
+			ref_x = ref_x_1;
+			ref_y = ref_y_1;
+		}
+	
+		vector<double> nxt_wp0 = getXY(car_s + 30, 2 + 4 * lane,
+		    map_waypoints_s, map_waypoints_x, map_waypoints_y);
+		vector<double> nxt_wp1 = getXY(car_s + 60, 2 + 4 * lane,
+		    map_waypoints_s, map_waypoints_x, map_waypoints_y);
+		vector<double> nxt_wp2 = getXY(car_s + 90, 2 + 4 * lane,
+		    map_waypoints_s, map_waypoints_x, map_waypoints_y);
+
+		pts_x.push_back(nxt_wp0[0]);
+		pts_x.push_back(nxt_wp1[0]);
+		pts_x.push_back(nxt_wp2[0]);
+
+		pts_y.push_back(nxt_wp0[1]);
+		pts_y.push_back(nxt_wp1[1]);
+		pts_y.push_back(nxt_wp2[1]);
+
+		for (unsigned int i = 0; i < pts_x.size(); i++) {
+			double shiftx = pts_x[i] - ref_x;
+			double shifty = pts_y[i] - ref_y;
+		
+			pts_x[i] = (shiftx * cos(0-angle) - shifty * sin(0-angle));	
+			pts_y[i] = (shiftx * sin(0-angle) + shifty * cos(0-angle));
+		}
+
+		assert (pts_x.size() == pts_y.size());
+
+		tk::spline s;
+		s.set_points(pts_x, pts_y);
+
+          	for(int i = 0; i < path_size; i++)
+		{
+			next_x_vals.push_back(previous_path_x[i]);
+			next_y_vals.push_back(previous_path_y[i]);
+		}
+
+		double target_x = 45.0;
+		double target_y = s(target_x);
+		double target_dist = sqrt((target_x*target_x) + (target_y)*(target_y));
+
+		double cur_x = 0, cur_y = 0, cur_x_T = 0, cur_y_T = 0;
+		double N = target_dist/(0.02*ref_speed_ms);
+		double inc = target_x/N;
+
+		for (int i = 1; i <= 60 - path_size; i++) {
+			cur_x += inc;
+			cur_y = s(cur_x);
+			cur_x_T = ref_x + (cur_x * cos(angle) - cur_y * sin(angle));
+			cur_y_T = ref_y + (cur_x * sin(angle) + cur_y * cos(angle));
+			next_x_vals.push_back(cur_x_T);
+			next_y_vals.push_back(cur_y_T);
+		}
+
           	msgJson["next_x"] = next_x_vals;
           	msgJson["next_y"] = next_y_vals;
 
@@ -251,7 +535,7 @@ int main() {
 
           	//this_thread::sleep_for(chrono::milliseconds(1000));
           	ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
-          
+ 
         }
       } else {
         // Manual driving
