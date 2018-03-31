@@ -1,6 +1,8 @@
 # CarND-Path-Planning-Project
 Self-Driving Car Engineer Nanodegree Program
 
+[video1]: ./path_planning.mp4 "Project Video"
+
 ### Source code:
 src/main.cpp implements path planner code. It can be run using build/path_planner
 
@@ -23,5 +25,6 @@ be atleast 5 seconds gap). Refer lines 376 to 449, main.cpp.
 In this case however, the future points are chosen from the desired lane.
 
 ### Results:
-The car can successfully drive 4.32 miles without any incidents as shown in the video below.
+The car can successfully drive 4.32 miles without any incidents as shown in the video below:
+[link to video](./path_planning.mp4)
 
